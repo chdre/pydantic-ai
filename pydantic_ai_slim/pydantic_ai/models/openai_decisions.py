@@ -598,7 +598,28 @@ def _question(name: str, question: DecisionQuestion) -> Question:
 
 def _instructions(instructions: JsonValue) -> str:
     """A question's instructions as the text the API requires on every question: empty where there are none."""
-    return '' if instructions is None else _text(instructions)
+    if instructions is None:
+        return ''
+    if not isinstance(instructions, dict):
+        return _text(instructions)
+    labels = (
+        ('premise', 'Premise'),
+        ('context', 'Context'),
+        ('field', 'Field'),
+        ('question', 'Question'),
+        ('option', 'Option'),
+        ('goal', 'Goal'),
+        ('yes', 'If yes'),
+        ('no', 'If no'),
+    )
+    known = {key for key, _ in labels}
+    lines = [
+        f'{label}: {_text(value)}'
+        for key, label in labels
+        if (value := instructions.get(key)) is not None and (key != 'field' or instructions.get('question') is None)
+    ]
+    lines += [f'{key}: {_text(value)}' for key, value in instructions.items() if key not in known and value is not None]
+    return '\n'.join(lines)
 
 
 def _with_meanings(instructions: JsonValue, criteria: NoulCriteria) -> JsonValue:

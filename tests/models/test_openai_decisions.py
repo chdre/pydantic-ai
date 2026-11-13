@@ -98,7 +98,12 @@ with try_import() as imports_successful:
     from openai.types.decision_create_params import DecisionCreateParams
 
     from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
-    from pydantic_ai.models.openai_decisions import OpenAIDecisionsModel, OpenAIDecisionsModelSettings
+    from pydantic_ai.models.openai_decisions import (
+        OpenAIDecisionsModel,
+        OpenAIDecisionsModelSettings,
+        _instructions,  # pyright: ignore[reportPrivateUsage]
+        _with_meanings,  # pyright: ignore[reportPrivateUsage]
+    )
     from pydantic_ai.providers.deepseek import DeepSeekProvider
     from pydantic_ai.providers.openai import OpenAIProvider
     from pydantic_ai.providers.openai_decisions import OpenAIDecisionsProvider  # pyright: ignore[reportDeprecated]
@@ -343,12 +348,18 @@ async def test_output_type(
                 {
                     'type': 'predicate',
                     'name': 'urgent',
-                    'instructions': '{"field": "urgent", "question": "Does this need a reply within the hour?", "goal": "Triage a support ticket."}',
+                    'instructions': """\
+Question: Does this need a reply within the hour?
+Goal: Triage a support ticket.\
+""",
                 },
                 {
                     'type': 'choice',
                     'name': 'area',
-                    'instructions': '{"field": "area", "question": "Which team owns it?", "goal": "Triage a support ticket."}',
+                    'instructions': """\
+Question: Which team owns it?
+Goal: Triage a support ticket.\
+""",
                     'choices': [{'value': 'billing'}, {'value': 'bug'}],
                 },
             ],
@@ -385,12 +396,20 @@ async def test_yes_no_meanings_and_rubric(
             {
                 'type': 'predicate',
                 'name': 'refund',
-                'instructions': '{"field": "refund", "question": "Do they want a refund?", "goal": "Read the customer\'s mood.", "yes": "They ask for their money back.", "no": "They do not."}',
+                'instructions': """\
+Question: Do they want a refund?
+Goal: Read the customer's mood.
+If yes: They ask for their money back.
+If no: They do not.\
+""",
             },
             {
                 'type': 'score',
                 'name': 'frustration',
-                'instructions': '{"field": "frustration", "question": "How frustrated is the customer?", "goal": "Read the customer\'s mood."}',
+                'instructions': """\
+Question: How frustrated is the customer?
+Goal: Read the customer's mood.\
+""",
                 'levels': [
                     {'label': '0', 'description': 'Calm'},
                     {'label': '1', 'description': 'Frustrated'},
@@ -434,13 +453,20 @@ async def test_enum_and_nested_fields(
             {
                 'type': 'choice',
                 'name': 'team',
-                'instructions': '{"field": "team", "question": "Which team owns it?", "goal": "Assign a support ticket."}',
+                'instructions': """\
+Question: Which team owns it?
+Goal: Assign a support ticket.\
+""",
                 'choices': [{'value': 'billing'}, {'value': 'bug'}],
             },
             {
                 'type': 'predicate',
                 'name': 'customer.vip',
-                'instructions': '{"field": "customer.vip", "context": ["customer: Who is writing in."], "question": "Are they on an enterprise plan?", "goal": "Assign a support ticket."}',
+                'instructions': """\
+Context: ["customer: Who is writing in."]
+Question: Are they on an enterprise plan?
+Goal: Assign a support ticket.\
+""",
             },
         ]
     )
@@ -488,12 +514,18 @@ async def test_conversation_and_route(
                 {
                     'type': 'predicate',
                     'name': 'Ticket.urgent',
-                    'instructions': '{"field": "urgent", "premise": "If the user\'s request calls for Ticket: Triage a support ticket.", "question": "Does this need a reply within the hour?"}',
+                    'instructions': """\
+Premise: If the user's request calls for Ticket: Triage a support ticket.
+Question: Does this need a reply within the hour?\
+""",
                 },
                 {
                     'type': 'choice',
                     'name': 'Ticket.area',
-                    'instructions': '{"field": "area", "premise": "If the user\'s request calls for Ticket: Triage a support ticket.", "question": "Which team owns it?"}',
+                    'instructions': """\
+Premise: If the user's request calls for Ticket: Triage a support ticket.
+Question: Which team owns it?\
+""",
                     'choices': [{'value': 'billing'}, {'value': 'bug'}],
                 },
                 {
@@ -609,7 +641,10 @@ async def test_rubric_over_the_limit(
             {
                 'type': 'choice',
                 'name': 'severity',
-                'instructions': '{"field": "severity", "question": "How severe is the problem?", "goal": "Rate a support ticket."}',
+                'instructions': """\
+Question: How severe is the problem?
+Goal: Rate a support ticket.\
+""",
                 'choices': [
                     {'value': '0', 'description': '0 of 10'},
                     {'value': '1', 'description': '1 of 10'},
@@ -843,13 +878,13 @@ async def test_output_enum_over_choice_limit_is_refused(allow_model_requests: No
             {
                 'type': 'predicate',
                 'name': 'q',
-                'instructions': '{"question": "Is this urgent?", "yes": "Today — before noon."}',
+                'instructions': 'Question: Is this urgent?\nIf yes: Today — before noon.',
             },
             id='text and yes',
         ),
         pytest.param(
             NoulQuestion(criteria=NoulCriteria(false='Not today.')),
-            {'type': 'predicate', 'name': 'q', 'instructions': '{"no": "Not today."}'},
+            {'type': 'predicate', 'name': 'q', 'instructions': 'If no: Not today.'},
             id='only no',
         ),
         pytest.param(NoulQuestion(), {'type': 'predicate', 'name': 'q', 'instructions': ''}, id='nothing'),
@@ -1416,7 +1451,7 @@ async def test_images_from_assistant_and_tool_returns_keep_their_labels_and_orde
                 {
                     'type': 'predicate',
                     'name': 'value',
-                    'instructions': '{"field": "value", "question": "Does the input include an image?"}',
+                    'instructions': 'Question: Does the input include an image?',
                 }
             ],
         }
@@ -1728,12 +1763,18 @@ async def test_image_is_prepared_once_for_route_then_fill(allow_model_requests: 
                     {
                         'type': 'predicate',
                         'name': 'urgent',
-                        'instructions': '{"field": "urgent", "premise": "If the user\'s request calls for Ticket: Triage a support ticket.", "question": "Does this need a reply within the hour?"}',
+                        'instructions': """\
+Premise: If the user's request calls for Ticket: Triage a support ticket.
+Question: Does this need a reply within the hour?\
+""",
                     },
                     {
                         'type': 'choice',
                         'name': 'area',
-                        'instructions': '{"field": "area", "premise": "If the user\'s request calls for Ticket: Triage a support ticket.", "question": "Which team owns it?"}',
+                        'instructions': """\
+Premise: If the user's request calls for Ticket: Triage a support ticket.
+Question: Which team owns it?\
+""",
                         'choices': [{'value': 'billing'}, {'value': 'bug'}],
                     },
                 ],
@@ -2122,7 +2163,10 @@ async def test_overfull_speculation_picks_then_fills_under_question_limit(allow_
                     {
                         'type': 'predicate',
                         'name': 'approved',
-                        'instructions': '{"field": "approved", "premise": "If the user\'s request calls for Approve: Approve this request.", "question": "Can this be approved?"}',
+                        'instructions': """\
+Premise: If the user's request calls for Approve: Approve this request.
+Question: Can this be approved?\
+""",
                     }
                 ],
             },
@@ -2904,9 +2948,9 @@ async def test_bare_fan_out_instructions_stay_the_question_without_a_developer_m
     assert result.output == ['a', 'b']
     (body,) = sent_bodies(captured)
     assert body['input'] == 'Help!'
-    assert [json.loads(q['instructions']) for q in body['questions']] == [
-        {'question': 'Which tags apply?', 'option': 'a'},
-        {'question': 'Which tags apply?', 'option': 'b'},
+    assert [q['instructions'] for q in body['questions']] == [
+        'Question: Which tags apply?\nOption: a',
+        'Question: Which tags apply?\nOption: b',
     ]
 
 
@@ -2936,7 +2980,7 @@ async def test_bare_output_route_then_fill_sends_its_instructions_as_the_questio
     ]
     assert fill_body['input'] == 'Charged twice.'
     (fill_question,) = fill_body['questions']
-    assert json.loads(fill_question['instructions'])['question'] == question
+    assert fill_question['instructions'] == f"Premise: If the user's request calls for output.\nQuestion: {question}"
 
 
 async def test_without_instructions_the_prompt_is_the_whole_input(allow_model_requests: None):
@@ -2946,10 +2990,10 @@ async def test_without_instructions_the_prompt_is_the_whole_input(allow_model_re
 
     (body,) = sent_bodies(captured)
     assert body['input'] == 'Help!'
-    assert [json.loads(q['instructions']) for q in body['questions']] == [
-        {'field': 'urgent', 'question': 'Does this need a reply within the hour?'},
-        {'field': 'tags', 'question': 'Which tags apply?', 'option': 'a'},
-        {'field': 'tags', 'question': 'Which tags apply?', 'option': 'b'},
+    assert [q['instructions'] for q in body['questions']] == [
+        'Question: Does this need a reply within the hour?',
+        'Question: Which tags apply?\nOption: a',
+        'Question: Which tags apply?\nOption: b',
     ]
 
 
@@ -3044,3 +3088,126 @@ async def test_undescribed_field_with_instructions_sends_bare_field_name(allow_m
     ]
     (question,) = body['questions']
     assert question['instructions'] == 'urgent'
+
+
+# Plain-text question instructions: one `Label: text` line per part, in a fixed order.
+
+
+def sent_instructions(captured: Captured) -> dict[str, str]:
+    return {q['name']: q['instructions'] for body in sent_bodies(captured) for q in body['questions']}
+
+
+class Described(BaseModel):
+    """Triage the ticket."""
+
+    urgent: bool
+    tags: list[Literal['a', 'b']] = Field(description='Which tags apply?')
+    customer: Customer = Field(description='Who is writing in.')
+
+
+async def test_plain_text_instructions_from_a_decision_model(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+
+    await Agent(mock_model(captured), output_type=Described).run('Help!')
+
+    sent = sent_instructions(captured)
+    assert sent['urgent'] == 'Field: urgent\nGoal: Triage the ticket.'
+    assert sent['tags.a'].startswith('Question: Which tags apply?\nOption: ')
+    assert sent['tags.a'].endswith('\nGoal: Triage the ticket.')
+    assert 'Field:' not in sent['tags.a']
+    assert sent['customer.vip'] == (
+        'Context: ["customer: Who is writing in."]\nQuestion: Are they on an enterprise plan?\nGoal: Triage the ticket.'
+    )
+
+
+def test_field_is_kept_only_without_a_question():
+    assert _instructions({'field': 'x', 'question': 'Q?', 'goal': 'G'}) == 'Question: Q?\nGoal: G'
+    assert _instructions({'field': 'x', 'goal': 'G'}) == 'Field: x\nGoal: G'
+    assert _instructions({'field': 'x', 'question': None, 'goal': 'G'}) == 'Field: x\nGoal: G'
+
+
+def test_fixed_order_with_option_and_undescribed_field():
+    assert _instructions({'goal': 'G', 'option': 'o', 'question': 'Q?'}) == 'Question: Q?\nOption: o\nGoal: G'
+    assert _instructions({'option': 'o', 'field': 'f'}) == 'Field: f\nOption: o'
+    everything: dict[str, JsonValue] = {
+        'goal': 'G',
+        'option': 'o',
+        'question': 'Q?',
+        'field': 'f',
+        'context': 'c',
+        'premise': 'p',
+        'no': 'n',
+        'yes': 'y',
+    }
+    assert _instructions(everything) == 'Premise: p\nContext: c\nQuestion: Q?\nOption: o\nGoal: G\nIf yes: y\nIf no: n'
+
+
+@pytest.mark.parametrize(
+    'instructions, expected',
+    [
+        pytest.param({'question': 'Q?', 'goal': 'G'}, 'Question: Q?\nGoal: G\nIf yes: Y\nIf no: N', id='with-question'),
+        pytest.param(None, 'If yes: Y\nIf no: N', id='standalone'),
+    ],
+)
+def test_yes_no_meanings_follow_goal(instructions: JsonValue, expected: str):
+    assert _instructions(_with_meanings(instructions, NoulCriteria(true='Y', false='N'))) == expected
+
+
+def test_only_one_meaning_given():
+    assert _instructions(_with_meanings({'question': 'Q?'}, NoulCriteria(false='N'))) == 'Question: Q?\nIf no: N'
+
+
+def test_unknown_keys_come_last_in_insertion_order():
+    instructions: dict[str, JsonValue] = {
+        'zeta': 'z',
+        'goal': 'G',
+        'alpha': 'a',
+        'yes': 'Y',
+        'ignored': None,
+        'question': 'Q?',
+    }
+
+    assert _instructions(instructions) == 'Question: Q?\nGoal: G\nIf yes: Y\nzeta: z\nalpha: a'
+
+
+def test_non_string_values_are_json_and_strings_are_not():
+    instructions: dict[str, JsonValue] = {
+        'context': ['customer', 'contact'],
+        'question': 'Say "hi"',
+        'goal': {'k': 1},
+        'zeta': 3,
+        'flag': True,
+    }
+
+    assert _instructions(instructions) == (
+        'Context: ["customer", "contact"]\nQuestion: Say "hi"\nGoal: {"k": 1}\nzeta: 3\nflag: true'
+    )
+
+
+@pytest.mark.parametrize(
+    'instructions, expected',
+    [
+        pytest.param('He said "hi"\nthen left', 'He said "hi"\nthen left', id='quotes-and-newline'),
+        pytest.param(None, '', id='none'),
+        pytest.param(['a', 'b'], '["a", "b"]', id='list'),
+        pytest.param(7, '7', id='number'),
+    ],
+)
+def test_non_dict_instructions(instructions: JsonValue, expected: str):
+    assert _instructions(instructions) == expected
+
+
+def test_known_key_insertion_order_does_not_change_output():
+    forward: dict[str, JsonValue] = {
+        'premise': 'p',
+        'context': 'c',
+        'field': 'f',
+        'option': 'o',
+        'goal': 'G',
+        'yes': 'Y',
+        'no': 'N',
+    }
+    backward = dict(reversed(list(forward.items())))
+
+    assert _instructions(forward) == _instructions(backward)
+    assert _instructions(forward).encode() == _instructions(backward).encode()
