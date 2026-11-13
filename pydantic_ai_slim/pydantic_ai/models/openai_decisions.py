@@ -43,12 +43,14 @@ from ..messages import (
     _translate_legacy_retry_part,  # pyright: ignore[reportPrivateUsage]
     is_multi_modal_content,
 )
-from ..profiles import ModelProfile, ModelProfileSpec
+from ..profiles import ModelProfile, ModelProfileSpec, merge_profile
 from ..profiles.decision import decision_model_profile
+from ..profiles.openai import OpenAIModelProfile
 from ..providers import Provider
-from ..settings import ModelSettings
+from ..settings import CacheSetting, ModelSettings
 from ..usage import RequestUsage
 from . import (
+    ModelRequestParameters,
     _unconverted_speech_part_error,  # pyright: ignore[reportPrivateUsage]
     _unprepared_part_error,  # pyright: ignore[reportPrivateUsage]
     _UnpreparedPart,  # pyright: ignore[reportPrivateUsage]
@@ -77,7 +79,16 @@ from .decision import (
 )
 
 try:
-    from openai import NOT_GIVEN, APIConnectionError, APIError, APIStatusError, APITimeoutError, AsyncOpenAI
+    from openai import (
+        NOT_GIVEN,
+        APIConnectionError,
+        APIError,
+        APIStatusError,
+        APITimeoutError,
+        AsyncOpenAI,
+        Omit,
+        omit as OMIT,
+    )
     from openai.types import Decision
     from openai.types.decision import (
         Answer,
@@ -87,6 +98,7 @@ try:
         AnswerAnswerResourceScore,
     )
     from openai.types.decision_create_params import (
+        PromptCacheOptions as DecisionPromptCacheOptions,
         Question,
         QuestionQuestionParamChoice,
         QuestionQuestionParamChoiceChoice,
@@ -113,6 +125,16 @@ try:
     from openai.types.responses.response_input_text_content_param import ResponseInputTextContentParam
 
     from ..providers.openai import OpenAIProvider
+    from .openai._caching import (
+        CACHE_SETTINGS_KEYS,
+        add_openai_prompt_cache_breakpoint,
+        cacheable_instruction_count,
+        keep_implicit_cache_without_breakpoints,
+        move_leading_cache_breakpoints,
+        openai_effective_cache_settings,
+        translate_openai_cache,
+    )
+    from .openai._settings import OpenAIChatModelSettings, OpenAIPromptCacheOptions
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'Please install the `openai` package to use the OpenAI Decisions model, '
@@ -132,8 +154,18 @@ OpenAIDecisionsModelName = str | Literal['gpt-6-luna']
 class OpenAIDecisionsModelSettings(DecisionModelSettings, total=False):
     """Settings used for an OpenAI Decisions API request."""
 
-    # ALL FIELDS MUST BE `openai_decisions_` PREFIXED SO YOU CAN MERGE THEM WITH OTHER MODELS.
-    # This class is a placeholder for any future Decisions API-specific settings.
+    # ALL FIELDS MUST BE `openai_` PREFIXED SO YOU CAN MERGE THEM WITH OTHER MODELS.
+
+    openai_prompt_cache_options: OpenAIPromptCacheOptions
+    """Prompt cache options sent as `prompt_cache_options`, as on [`OpenAIResponsesModel`][pydantic_ai.models.openai.OpenAIResponsesModel].
+
+    The Decisions API accepts a `ttl` of `'30m'` only; `'12h'` raises a
+    [`UserError`][pydantic_ai.exceptions.UserError] before a request is sent. Takes precedence over the unified
+    `cache` setting.
+    """
+
+    openai_cache_instructions: bool
+    """Whether to put a cache breakpoint after the agent's instructions, the leading `developer` message."""
 
 
 @dataclass(init=False)
@@ -251,29 +283,90 @@ class OpenAIDecisionsModel(DecisionModel[AsyncOpenAI]):
         return 'openai-decisions'
 
     def _provider_model_profile(self) -> ModelProfile:
-        # The provider profiles a model name such as `gpt-6-luna` as a Responses API model, whose structured output,
-        # thinking and caching this endpoint has none of.
-        return decision_model_profile(self.model_name)
+        # The provider profiles a model name such as `gpt-6-luna` as a Responses API model, whose structured output
+        # and thinking this endpoint has none of. Its prompt cache breakpoints work as on the Responses API, with
+        # the 30-minute retention only.
+        return merge_profile(
+            decision_model_profile(self.model_name),
+            OpenAIModelProfile(
+                supports_cache=True,
+                openai_supports_prompt_cache_breakpoints=True,
+                supported_cache_retentions=('30m',),
+            ),
+        )
+
+    def _has_provider_cache_settings(self, merged_settings: ModelSettings) -> bool:
+        return any(key in merged_settings for key in CACHE_SETTINGS_KEYS)
+
+    def _caching_not_enabled(self, model_settings: ModelSettings | None) -> bool:
+        # As on the Responses API, OpenAI caches implicitly even when nothing is configured.
+        if self.profile.get('openai_supports_prompt_cache_breakpoints', False):
+            return False
+        return super()._caching_not_enabled(model_settings)  # pragma: no cover
+
+    def _effective_cache_settings(self, merged_settings: ModelSettings) -> tuple[CacheSetting | None, ...]:
+        if self._has_provider_cache_settings(merged_settings) and self.profile.get('supports_cache', False):
+            return openai_effective_cache_settings(cast(OpenAIChatModelSettings, merged_settings))
+        return super()._effective_cache_settings(merged_settings)
+
+    def prepare_request(
+        self,
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> tuple[ModelSettings | None, ModelRequestParameters]:
+        model_settings, model_request_parameters = super().prepare_request(model_settings, model_request_parameters)
+        model_settings = translate_openai_cache(
+            cast(OpenAIModelProfile, self.profile), model_settings, model_request_parameters
+        )
+        # `DecisionRequest.instructions` is one text, so a dynamic part would end up inside the instruction
+        # breakpoint, and its changes would invalidate the cached prefix on every request. Without a breakpoint,
+        # `keep_implicit_cache_without_breakpoints` falls back to implicit caching for the unified setting.
+        parts = model_request_parameters.instruction_parts
+        if (
+            model_settings
+            and model_settings.get('openai_cache_instructions')
+            and parts
+            and cacheable_instruction_count(parts) < len(parts)
+        ):
+            model_settings = cast(ModelSettings, {**model_settings, 'openai_cache_instructions': False})
+        return model_settings, model_request_parameters
 
     async def decide(self, request: DecisionRequest, model_settings: DecisionModelSettings) -> DecisionResponse:
         """Send one request to the `/v1/decisions` endpoint."""
-        extra_headers = _with_default_user_agent(model_settings.get('extra_headers', {}))
+        # Copied, as `keep_implicit_cache_without_breakpoints` changes it.
+        settings = cast(OpenAIDecisionsModelSettings, {**model_settings})
+        extra_headers = _with_default_user_agent(settings.get('extra_headers', {}))
+        cache_options = settings.get('openai_prompt_cache_options')
+        if cache_options is not None and (ttl := cache_options.get('ttl', '30m')) != '30m':
+            raise UserError(f'OpenAI Decisions supports a prompt cache `ttl` of `30m` only, not {ttl!r}.')
         self._check_request_limits(image_count=len(request.images), question_count=len(request.questions))
         if any(not image.is_image for image in request.images):
             raise UserError('OpenAI Decisions supports image evidence only; `request.images` contains a non-image.')
+        cache_instructions = bool(settings.get('openai_cache_instructions'))
         decision_input = (
-            _Conversation(request.images, self.profile).items(request.messages, request.instructions)
+            _Conversation(request.images, self.profile).items(
+                request.messages, request.instructions, cache_instructions=cache_instructions
+            )
             if request.messages
-            else _state_input(request)
+            else _state_input(request, cache_instructions=cache_instructions)
+        )
+        keep_implicit_cache_without_breakpoints(
+            cast('OpenAIChatModelSettings', settings),
+            cast('list[ResponseInputItemParam]', decision_input) if isinstance(decision_input, list) else [],
+        )
+        # The SDK's `PromptCacheOptions` is the same two keys as `OpenAIPromptCacheOptions`.
+        prompt_cache_options = cast(
+            'DecisionPromptCacheOptions | Omit', settings.get('openai_prompt_cache_options', OMIT)
         )
         try:
-            response = await with_max_retries(self.client, model_settings).decisions.with_raw_response.create(
+            response = await with_max_retries(self.client, settings).decisions.with_raw_response.create(
                 model=self._model_name,
                 input=decision_input,
                 questions=[_question(name, question) for name, question in request.questions.items()],
+                prompt_cache_options=prompt_cache_options,
                 extra_headers=extra_headers,
-                extra_body=model_settings.get('extra_body'),
-                timeout=to_httpx2_timeout(model_settings.get('timeout', NOT_GIVEN)),
+                extra_body=settings.get('extra_body'),
+                timeout=to_httpx2_timeout(settings.get('timeout', NOT_GIVEN)),
             )
         except APIError as e:
             raise _api_error(e, self._model_name) from e
@@ -340,12 +433,18 @@ def _tool_call_ids(messages: Sequence[ModelMessage]) -> set[str]:
     }
 
 
-def _developer(instructions: str) -> EasyInputMessageParam:
-    """The agent's instructions as the `developer` message that leads the input."""
-    return EasyInputMessageParam(type='message', role='developer', content=instructions)
+def _developer(instructions: str, cache: bool = False) -> EasyInputMessageParam:
+    """The agent's instructions as the `developer` message that leads the input, ending in a cache breakpoint if `cache`."""
+    if not cache:
+        return EasyInputMessageParam(type='message', role='developer', content=instructions)
+    content: ResponseInputMessageContentListParam = [ResponseInputTextParam(type='input_text', text=instructions)]
+    add_openai_prompt_cache_breakpoint(content)
+    return EasyInputMessageParam(type='message', role='developer', content=content)
 
 
-def _state_input(request: DecisionRequest) -> str | list[DecisionInputMessageParam]:
+def _state_input(
+    request: DecisionRequest, *, cache_instructions: bool = False
+) -> str | list[DecisionInputMessageParam]:
     """A request without a conversation, as its `state` in one user message with each image after its label.
 
     The request's instructions, if any, lead it as a `developer` message.
@@ -357,7 +456,7 @@ def _state_input(request: DecisionRequest) -> str | list[DecisionInputMessagePar
         # The SDK still types `input` as user messages only; see `_Conversation`.
         return cast(
             list[DecisionInputMessageParam],
-            [_developer(request.instructions), EasyInputMessageParam(role='user', content=text)],
+            [_developer(request.instructions, cache_instructions), EasyInputMessageParam(role='user', content=text)],
         )
     content: list[DecisionInputPartUnionParam] = [DecisionInputTextParam(type='input_text', text=text)]
     for index, image in enumerate(request.images, start=1):
@@ -368,7 +467,7 @@ def _state_input(request: DecisionRequest) -> str | list[DecisionInputMessagePar
     user = DecisionInputMessageParam(role='user', content=content)
     if request.instructions is None:
         return [user]
-    return cast(list[DecisionInputMessageParam], [_developer(request.instructions), user])
+    return cast(list[DecisionInputMessageParam], [_developer(request.instructions, cache_instructions), user])
 
 
 class _Conversation:
@@ -389,11 +488,11 @@ class _Conversation:
         self._items: list[ResponseInputItemParam] = []
 
     def items(
-        self, messages: Sequence[ModelMessage], instructions: str | None = None
+        self, messages: Sequence[ModelMessage], instructions: str | None = None, *, cache_instructions: bool = False
     ) -> str | list[DecisionInputMessageParam]:
         if instructions is not None:
             # Sent once, ahead of the conversation, rather than in every question.
-            self._items.append(_developer(instructions))
+            self._items.append(_developer(instructions, cache_instructions))
         calls = _tool_call_ids(messages)
         for message in messages:
             if isinstance(message, ModelRequest):
@@ -402,6 +501,7 @@ class _Conversation:
             else:
                 for part in message.parts:
                     self._response_part(part, calls)
+        move_leading_cache_breakpoints(self._items, text_type='input_text')
         if next(self._images, None) is not None:
             raise UserError('`request.images` holds more images than `request.messages` refers to.')
         match self._items:
@@ -452,17 +552,19 @@ class _Conversation:
                 )
         return output
 
-    def _user(self, items: Sequence[str | MultiModalContent]) -> None:
-        if len(items) == 1 and isinstance(text := items[0], str):
+    def _user(self, items: Sequence[str | MultiModalContent], breakpoints: frozenset[int] = frozenset()) -> None:
+        if len(items) == 1 and isinstance(text := items[0], str) and not breakpoints:
             self._items.append(EasyInputMessageParam(role='user', content=text))
             return
         content: ResponseInputMessageContentListParam = []
-        for item in items:
+        for index, item in enumerate(items):
             if isinstance(item, str):
                 content.append(ResponseInputTextParam(type='input_text', text=item))
             else:
                 _, image, detail = self._image()
                 content.append(ResponseInputImageParam(type='input_image', image_url=image.data_uri, detail=detail))
+            if index in breakpoints:
+                add_openai_prompt_cache_breakpoint(content)
         self._items.append(EasyInputMessageParam(role='user', content=content))
 
     def _message(self, role: Literal['assistant', 'system', 'developer'], content: str) -> None:
@@ -494,16 +596,21 @@ class _Conversation:
 
     def _user_prompt(self, part: UserPromptPart) -> None:
         prompt: list[str | MultiModalContent] = []
+        breakpoints: set[int] = set()
         for item in [part.content] if isinstance(part.content, str) else part.content:
             if isinstance(item, str):
                 prompt.append(item)
             elif isinstance(item, TextContent):
                 prompt.append(item.content)
             elif isinstance(item, CachePoint):
-                pass  # A marker for models that cache a prompt prefix; there is nothing in it to send.
+                if not prompt:
+                    # Nothing before it in this prompt: an empty text part carries it until
+                    # `move_leading_cache_breakpoints` moves it onto the previous item, or raises if there's none.
+                    prompt.append('')
+                breakpoints.add(len(prompt) - 1)
             else:
                 prompt.append(item)
-        self._user(prompt)
+        self._user(prompt, frozenset(breakpoints))
 
     def _tool_return(self, part: BaseToolReturnPart, calls: set[str]) -> None:
         if part.tool_call_id in calls:

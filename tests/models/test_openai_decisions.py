@@ -11,6 +11,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -75,6 +76,7 @@ from pydantic_ai.models.decision import (
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles.decision import DecisionModelProfile, decision_model_profile
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ObjectJsonSchema, ToolDefinition
 from pydantic_ai.usage import RequestUsage
 
@@ -196,7 +198,7 @@ DECISION_PROFILE = {
     'supports_json_schema_output': False,
     'supports_json_object_output': False,
     'supports_thinking': False,
-    'supports_cache': False,
+    'supports_cache': True,
     'supports_image_output': False,
     'json_schema_transformer': None,
     'tool_deferral_mode': None,
@@ -2636,7 +2638,7 @@ async def test_history_goes_as_native_items(allow_model_requests: None):
             {
                 'role': 'user',
                 'content': [
-                    {'type': 'input_text', 'text': 'Help me '},
+                    {'type': 'input_text', 'text': 'Help me ', 'prompt_cache_breakpoint': {'mode': 'explicit'}},
                     {'type': 'input_text', 'text': 'with my invoice.'},
                 ],
             },
@@ -3044,3 +3046,196 @@ async def test_undescribed_field_with_instructions_sends_bare_field_name(allow_m
     ]
     (question,) = body['questions']
     assert question['instructions'] == 'urgent'
+
+
+EXPLICIT = {'mode': 'explicit'}
+
+
+async def test_cache_point_marks_the_preceding_text_part(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+
+    await Agent(mock_model(captured), output_type=Out).run(['ctx', CachePoint(), 'query'])
+
+    (body,) = sent_bodies(captured)
+    assert body['input'] == [
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'input_text', 'text': 'ctx', 'prompt_cache_breakpoint': EXPLICIT},
+                {'type': 'input_text', 'text': 'query'},
+            ],
+        }
+    ]
+
+
+async def test_cache_point_marks_the_preceding_image_part(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    image = BinaryContent(b'picture', media_type='image/png')
+
+    await Agent(mock_model(captured), output_type=Out).run(['look', image, CachePoint(), 'query'])
+
+    (body,) = sent_bodies(captured)
+    text, picture, query = body['input'][0]['content']
+    assert text == {'type': 'input_text', 'text': 'look'}
+    assert picture == {
+        'type': 'input_image',
+        'image_url': IsStr(regex=r'data:image/png;base64,.*'),
+        'detail': 'auto',
+        'prompt_cache_breakpoint': EXPLICIT,
+    }
+    assert query == {'type': 'input_text', 'text': 'query'}
+
+
+async def test_leading_cache_point_is_rejected_before_a_request(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+
+    with pytest.raises(UserError, match='CachePoint cannot be the first content'):
+        await Agent(mock_model(captured), output_type=Out).run([CachePoint(), 'query'])
+
+    assert captured.requests == []
+
+
+async def test_leading_cache_point_attaches_to_the_previous_conversation_item(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart('earlier')]),
+        ModelResponse(parts=[TextPart('ok')]),
+    ]
+
+    await Agent(mock_model(captured), output_type=Out).run([CachePoint(), 'next'], message_history=history)
+
+    (body,) = sent_bodies(captured)
+    assert body['input'] == [
+        {
+            'role': 'user',
+            'content': [{'type': 'input_text', 'text': 'earlier', 'prompt_cache_breakpoint': EXPLICIT}],
+        },
+        {'role': 'assistant', 'content': 'ok'},
+        {'role': 'user', 'content': [{'type': 'input_text', 'text': 'next'}]},
+    ]
+
+
+async def test_leading_cache_point_attaches_to_the_instructions(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+
+    await Agent(mock_model(captured), output_type=Out, instructions='Be brief.').run([CachePoint(), 'query'])
+
+    (body,) = sent_bodies(captured)
+    assert body['input'][0] == {
+        'type': 'message',
+        'role': 'developer',
+        'content': [{'type': 'input_text', 'text': 'Be brief.', 'prompt_cache_breakpoint': EXPLICIT}],
+    }
+
+
+def test_unconfigured_caching_is_not_reported_and_provider_options_set_the_retention():
+    model = mock_model(Captured(answer_every_question))
+    settings: OpenAIDecisionsModelSettings = {'openai_prompt_cache_options': {'mode': 'implicit'}}
+
+    assert model._caching_not_enabled(None) is False  # pyright: ignore[reportPrivateUsage]
+    assert model.resolve_cache_retention(settings) == timedelta(minutes=30)
+
+
+async def test_dynamic_instructions_are_kept_out_of_the_instruction_breakpoint(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    agent = Agent(mock_model(captured), output_type=Out)
+
+    @agent.instructions
+    def now() -> str:
+        return 'DYNAMIC 12:34:56'
+
+    await agent.run('Help!', model_settings=ModelSettings(cache={'messages': False}))
+
+    (body,) = sent_bodies(captured)
+    assert body['input'][0] == {'type': 'message', 'role': 'developer', 'content': 'DYNAMIC 12:34:56'}
+    assert 'prompt_cache_breakpoint' not in json.dumps(body['input'])
+    assert body['prompt_cache_options'] == {'mode': 'implicit', 'ttl': '30m'}
+
+
+async def test_static_and_dynamic_instructions_get_no_instruction_breakpoint(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    agent = Agent(mock_model(captured), output_type=Out, instructions='STATIC')
+
+    @agent.instructions
+    def now() -> str:
+        return 'DYNAMIC 12:34:56'
+
+    await agent.run('Help!', model_settings=ModelSettings(cache={'messages': False}))
+
+    (body,) = sent_bodies(captured)
+    assert body['input'][0] == {'type': 'message', 'role': 'developer', 'content': 'STATIC\n\nDYNAMIC 12:34:56'}
+    assert 'prompt_cache_breakpoint' not in json.dumps(body['input'])
+    assert body['prompt_cache_options'] == {'mode': 'implicit', 'ttl': '30m'}
+
+
+async def test_unified_cache_sets_implicit_options_and_marks_the_instructions(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    agent = Agent(mock_model(captured), output_type=Out, instructions=BACKGROUND)
+
+    await agent.run('Help!', model_settings=ModelSettings(cache=True))
+
+    (body,) = sent_bodies(captured)
+    assert body['prompt_cache_options'] == {'mode': 'implicit', 'ttl': '30m'}
+    assert body['input'] == [
+        {
+            'type': 'message',
+            'role': 'developer',
+            'content': [{'type': 'input_text', 'text': BACKGROUND, 'prompt_cache_breakpoint': EXPLICIT}],
+        },
+        {'role': 'user', 'content': 'Help!'},
+    ]
+
+
+async def test_caller_set_cache_options_are_sent_as_given(allow_model_requests: None):
+    """Explicit options with no breakpoint anywhere stay explicit: only the unified prefix-only setting falls back."""
+    captured = Captured(answer_every_question)
+    settings: OpenAIDecisionsModelSettings = {'openai_prompt_cache_options': {'mode': 'explicit'}}
+
+    await Agent(mock_model(captured), output_type=Out).run('Help!', model_settings=settings)
+
+    (body,) = sent_bodies(captured)
+    assert body['input'] == 'Help!'
+    assert body['prompt_cache_options'] == EXPLICIT
+
+
+async def test_prefix_only_cache_keeps_the_instruction_breakpoint_explicit(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    agent = Agent(mock_model(captured), output_type=Out, instructions=BACKGROUND)
+
+    await agent.run('Help!', model_settings=ModelSettings(cache={'messages': False}))
+
+    (body,) = sent_bodies(captured)
+    assert body['prompt_cache_options'] == {'mode': 'explicit', 'ttl': '30m'}
+    assert body['input'][0]['content'][0]['prompt_cache_breakpoint'] == EXPLICIT
+
+
+async def test_prefix_only_cache_without_any_breakpoint_falls_back_to_implicit(allow_model_requests: None):
+    """Plain string input, no instructions and no `CachePoint`: nothing carries a breakpoint, so it caches like `cache=True`."""
+    captured = Captured(answer_every_question)
+
+    await Agent(mock_model(captured), output_type=Out).run(
+        'Help!', model_settings=ModelSettings(cache={'messages': False})
+    )
+
+    (body,) = sent_bodies(captured)
+    assert body['input'] == 'Help!'
+    assert body['prompt_cache_options'] == {'mode': 'implicit', 'ttl': '30m'}
+
+
+async def test_unified_12h_cache_snaps_to_the_30m_the_endpoint_supports(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+
+    await Agent(mock_model(captured), output_type=Out).run('Help!', model_settings=ModelSettings(cache='12h'))
+
+    (body,) = sent_bodies(captured)
+    assert body['prompt_cache_options'] == {'mode': 'implicit', 'ttl': '30m'}
+
+
+async def test_12h_cache_options_are_rejected_before_a_request(allow_model_requests: None):
+    captured = Captured(answer_every_question)
+    settings: OpenAIDecisionsModelSettings = {'openai_prompt_cache_options': {'mode': 'implicit', 'ttl': '12h'}}
+
+    with pytest.raises(UserError, match='12h'):
+        await Agent(mock_model(captured), output_type=Out).run('Help!', model_settings=settings)
+
+    assert captured.requests == []
